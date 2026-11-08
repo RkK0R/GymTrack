@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Contador de repeticiones</title>
+<style>
+:root{--bg:#E8EBEE;--card:#fff;--ink:#18222C;--mute:#5A6773;--line:#CBD2D9;--acc:#0E7C66;--on:#fff;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#12181D;--card:#1B242B;--ink:#E6ECF0;--mute:#96A3AE;--line:#2B3741;--acc:#3FC1A3;--on:#07201A;color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:400 16px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+.wrap{max-width:560px;margin:0 auto;padding:16px 14px 40px}
+h1{font:700 34px/1.05 "Arial Narrow",Impact,system-ui,sans-serif;margin:0}
+.sub,.mute{color:var(--mute);margin:4px 0 12px}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 10px}
+select,.btn{padding:12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink);font:600 16px system-ui,sans-serif;flex:1;min-width:0}
+.btn.pri{background:var(--acc);color:var(--on);border-color:var(--acc)}
+button:focus-visible,select:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+.stage{position:relative;background:#000;border-radius:12px;overflow:hidden;min-height:200px;margin:0 0 10px}
+.stage video{display:block;width:100%;height:auto}
+.stage canvas{position:absolute;top:0;left:0;width:100%;height:100%}
+.stage.mirror video,.stage.mirror canvas{transform:scaleX(-1)}
+#hud{position:absolute;left:10px;top:10px;background:rgba(0,0,0,.6);color:#fff;border-radius:10px;padding:6px 12px;display:flex;align-items:baseline;gap:10px}
+#cnt{font:700 52px/1 "Arial Narrow",Impact,system-ui,sans-serif}
+#ph{font-weight:600}
+.note{color:var(--acc);font-weight:600;margin:0 0 12px;min-height:1.5em}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Contador de repeticiones</h1>
+<p class="sub">Prototipo. El video se procesa en tu teléfono y no se envía a ningún servidor.</p>
+<div class="row">
+<select id="ex" aria-label="Ejercicio">
+<option value="sentadilla">Sentadilla</option>
+<option value="flexiones">Flexiones</option>
+<option value="militar">Press militar</option>
+</select>
+<select id="cam" aria-label="Cámara">
+<option value="user">Cámara frontal</option>
+<option value="environment">Cámara trasera</option>
+</select>
+</div>
+<p id="tip" class="mute"></p>
+<div class="stage" id="stage">
+<video id="v" playsinline muted></video>
+<canvas id="c"></canvas>
+<div id="hud"><b id="cnt">0</b><span id="ph">—</span></div>
+</div>
+<p id="msg" class="note" role="status">Pulsa Iniciar para activar la cámara.</p>
+<div class="row">
+<button id="go" class="btn pri">Iniciar</button>
+<button id="m1" class="btn" aria-label="Restar una repetición">−1</button>
+<button id="p1" class="btn" aria-label="Sumar una repetición">+1</button>
+<button id="rs" class="btn">Reiniciar</button>
+</div>
+<p class="mute">El conteo no es perfecto: usa −1 y +1 para corregirlo.</p>
+</div>
+<script type="module">
+import {PoseLandmarker,FilesetResolver,DrawingUtils} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+const WASM="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task";
+// Cada ejercicio mide el ángulo de una articulación (puntos de MediaPipe: izquierda y derecha).
+// lo: por debajo de este ángulo cuenta como "abajo". hi: por encima cuenta como "arriba".
+const EX={
+ sentadilla:{j:[[23,25,27],[24,26,28]],lo:100,hi:160,tip:"Colócate de lado, a 2–3 m, con el cuerpo completo en cuadro. Cuenta al bajar hasta unos 100° de rodilla y volver a subir."},
+ flexiones:{j:[[11,13,15],[12,14,16]],lo:95,hi:155,tip:"Apoya el teléfono a ras de suelo, de lado. Cuenta al bajar hasta unos 95° de codo y volver a extender."},
+ militar:{j:[[11,13,15],[12,14,16]],lo:100,hi:160,top:true,tip:"Ponte de frente o de lado, con brazos y cabeza en cuadro. Cuenta al extender los brazos por encima de los hombros."}
+};
+const $=id=>document.getElementById(id);
+const v=$("v"),c=$("c"),ctx=c.getContext("2d"),ex=$("ex"),cam=$("cam"),go=$("go"),stage=$("stage");
+let lm=null,draw=null,stream=null,run=false,last=-1,count=0,phase=null,sm=null,dip=false,AC=null;
+function msg(t){$("msg").textContent=t}
+function hud(){$("cnt").textContent=count;$("ph").textContent=(phase==="down"?"Abajo":phase==="up"?"Arriba":"—")+(sm==null?"":" · "+Math.round(sm)+"°")}
+function reset(){count=0;phase=null;sm=null;dip=false;hud()}
+function tip(){$("tip").textContent=EX[ex.value].tip}
+function beep(){try{if(!AC)return;const o=AC.createOscillator(),g=AC.createGain(),t=AC.currentTime;o.type="sine";o.frequency.value=880;g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.2,t+.01);g.gain.exponentialRampToValueAtTime(.0001,t+.15);o.connect(g);g.connect(AC.destination);o.start(t);o.stop(t+.16)}catch(e){}}
+function angle(a,b,d,W,H){
+ const ux=(a.x-b.x)*W,uy=(a.y-b.y)*H,wx=(d.x-b.x)*W,wy=(d.y-b.y)*H;
+ const m=Math.hypot(ux,uy)*Math.hypot(wx,wy)||1;
+ return Math.acos(Math.max(-1,Math.min(1,(ux*wx+uy*wy)/m)))*180/Math.PI}
+function step(p){
+ const e=EX[ex.value],W=v.videoWidth,H=v.videoHeight;
+ let best=null;
+ for(const ch of e.j){const pts=ch.map(i=>p[i]),vis=Math.min(...pts.map(q=>q.visibility??0));if(!best||vis>best.vis)best={vis,pts}}
+ if(best.vis<.5){msg("Aléjate o cambia el ángulo para que se vea el cuerpo completo.");return}
+ const [a,b,d]=best.pts,ang=angle(a,b,d,W,H);
+ sm=sm==null?ang:sm*.6+ang*.4;
+ const bent=sm<e.lo;
+ let ext=sm>e.hi;
+ if(e.top)ext=ext&&d.y<a.y;
+ if(bent){if(phase!=="down"){phase="down";dip=false}}
+ else if(ext){
+  if(phase==="down"){count++;beep();msg("¡Repetición "+count+"!")}
+  else if(phase==="up"&&dip)msg("Repetición incompleta: baja un poco más.");
+  phase="up";dip=false}
+ else if(phase==="up"&&sm<(e.lo+e.hi)/2)dip=true;
+ hud()}
+function loop(){
+ if(!run)return;
+ if(v.readyState>=2&&v.currentTime!==last){
+  last=v.currentTime;
+  if(c.width!==v.videoWidth){c.width=v.videoWidth;c.height=v.videoHeight}
+  const r=lm.detectForVideo(v,performance.now());
+  ctx.clearRect(0,0,c.width,c.height);
+  const p=r.landmarks&&r.landmarks[0];
+  if(p){draw.drawConnectors(p,PoseLandmarker.POSE_CONNECTIONS,{color:"#3FC1A3",lineWidth:3});draw.drawLandmarks(p,{radius:3,color:"#ffffff"});step(p)}
+  else msg("No te veo. Colócate dentro del cuadro.")}
+ requestAnimationFrame(loop)}
+async function load(){
+ if(lm)return;
+ msg("Cargando modelo… la primera vez puede tardar unos segundos.");
+ const fs=await FilesetResolver.forVisionTasks(WASM);
+ const opt=d=>({baseOptions:{modelAssetPath:MODEL,delegate:d},runningMode:"VIDEO",numPoses:1});
+ try{lm=await PoseLandmarker.createFromOptions(fs,opt("GPU"))}
+ catch(e){lm=await PoseLandmarker.createFromOptions(fs,opt("CPU"))}
+ draw=new DrawingUtils(ctx)}
+async function start(){
+ go.disabled=true;
+ try{
+  AC=AC||new (window.AudioContext||window.webkitAudioContext)();AC.resume&&AC.resume();
+  await load();
+  stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:cam.value,width:{ideal:640}},audio:false});
+  v.srcObject=stream;await v.play();
+  stage.classList.toggle("mirror",cam.value==="user");
+  run=true;go.textContent="Detener";msg("Listo. Empieza a entrenar.");loop()
+ }catch(e){msg("No se pudo iniciar: "+(e&&e.name==="NotAllowedError"?"permite el acceso a la cámara.":"revisa la conexión y que la página use HTTPS."))}
+ go.disabled=false}
+function stop(){run=false;if(stream)stream.getTracks().forEach(t=>t.stop());stream=null;v.srcObject=null;ctx.clearRect(0,0,c.width,c.height);go.textContent="Iniciar";msg("Cámara detenida.")}
+go.onclick=()=>run?stop():start();
+ex.onchange=()=>{reset();tip()};
+cam.onchange=()=>{if(run){stop();start()}};
+$("m1").onclick=()=>{count=Math.max(0,count-1);hud()};
+$("p1").onclick=()=>{count++;hud()};
+$("rs").onclick=reset;
+tip();hud();
+</script>
+</body>
+</html>
